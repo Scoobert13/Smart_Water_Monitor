@@ -1,0 +1,190 @@
+esphome:
+  name: smart-water-monitor
+  friendly_name: "Smart Water Monitor"
+  comment: "IoT module for home water system monitoring (flow, pressure, leak detection)"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# --- Network / Home Assistant integration ---
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: "Smart Water Monitor Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  level: INFO
+
+# --- I2C for the LCD display ---
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+  frequency: 50khz
+
+display:
+  - platform: lcd_pcf8574
+    dimensions: 16x2
+    address: 0x27
+    update_interval: 200ms
+    lambda: |-
+      if (id(press_count) > 0) {
+        it.print(0, 0, "Press 3 times");
+        it.printf(0, 1, "Presses: %d / 3", id(press_count));
+      }
+      else if (id(mounting_mode).state) {
+        it.printf(0, 0, "P:%.2fbar", id(pressure_bar).state);
+        it.printf(0, 1, "F:%.1f L/min", id(water_flow).state);
+      }
+      else if (id(water_detected).state) {
+        it.print(0, 0, "!! ALARM !!");
+        it.print(0, 1, "Water leak!");
+      } else if (id(pressure_bar).state < 1.0) {
+        it.print(0, 0, "PRESSURE LOW!");
+        it.printf(0, 1, "%.2f bar", id(pressure_bar).state);
+      } else if (id(pressure_bar).state > 6.0) {
+        it.print(0, 0, "PRESSURE HIGH!");
+        it.printf(0, 1, "%.2f bar", id(pressure_bar).state);
+      } else if (id(water_flow).state < 5.0 && id(water_flow).state > 0.0) {
+        it.print(0, 0, "FLOW LOW!");
+        it.printf(0, 1, "%.1f L/min", id(water_flow).state);
+      } else if (id(water_flow).state > 20.0) {
+        it.print(0, 0, "FLOW HIGH!");
+        it.printf(0, 1, "%.1f L/min", id(water_flow).state);
+      }
+      else {
+        it.printf(0, 0, "Flow:%.1fL/m", id(water_flow).state);
+        it.printf(0, 1, "Pres.:%.2f bar", id(pressure_bar).state);
+      }
+
+# --- Analog / numeric sensors ---
+sensor:
+  # Pressure sensor (1/8 NPT Stainless Steel Pressure Transducer, 0-690 kPa / 0-100 PSI)
+  - platform: adc
+    pin: GPIO36
+    name: "Water Pressure"
+    id: pressure_bar
+    attenuation: 12db
+    update_interval: 2s
+    accuracy_decimals: 2
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+      - multiply: 1.5     # compensates the resistive divider R1=10k / R2=20k
+      - lambda: return ((x - 0.72) * 24.81 * 0.0689476) + 1.433
+      - clamp:
+          min_value: 0
+          max_value: 7.9
+    unit_of_measurement: "bar"
+    device_class: pressure
+    state_class: measurement
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return x < 1.0 && !id(mounting_mode).state;
+            then:
+              - logger.log: "ALARM: Pressure too low!"
+        - if:
+            condition:
+              lambda: return x > 6.0 && !id(mounting_mode).state;
+            then:
+              - logger.log: "ALARM: Pressure too high!"
+
+  # Flow sensor (YF-S201, K-factor ~7.5 pulses/L, datasheet formula Hz = 18*Q - 3)
+  - platform: pulse_counter
+    pin:
+      number: GPIO15
+      mode: INPUT_PULLUP
+    name: "Water Flow"
+    id: water_flow
+    update_interval: 1s
+    filters:
+      - lambda: "return (x + 3.0) / 18.0;"
+      - lambda: "return x < 1.0 ? 0.0 : x;"
+    unit_of_measurement: "L/min"
+    accuracy_decimals: 1
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return x < 5.0 && x > 0.0 && !id(mounting_mode).state;
+            then:
+              - logger.log: "ALARM: Flow too low! (below 5 L/min)"
+        - if:
+            condition:
+              lambda: return x > 20.0 && !id(mounting_mode).state;
+            then:
+              - logger.log: "ALARM: Flow too high! (above 20 L/min)"
+
+# --- Digital sensors ---
+binary_sensor:
+  # Leak sensor (FC-37, resistive, active LOW)
+  - platform: gpio
+    pin:
+      number: GPIO27
+      mode: INPUT
+      inverted: true
+    name: "Water Detected"
+    id: water_detected
+    device_class: moisture
+    filters:
+      - delayed_on: 500ms
+      - delayed_off: 1000ms
+
+  # Mounting-mode button (VCC/GND/OUT, inverted logic)
+  - platform: gpio
+    pin:
+      number: GPIO16
+      mode: INPUT
+      inverted: true
+    name: "Mounting Mode Button"
+    id: mounting_button
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      then:
+        - script.execute: reset_timer
+        - lambda: |-
+            id(press_count)++;
+            if (id(press_count) >= 3) {
+              id(press_count) = 0;
+              id(reset_timer).stop();
+              id(mounting_mode).toggle();
+            }
+
+switch:
+  - platform: template
+    name: "Mounting Mode"
+    id: mounting_mode
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+
+script:
+  - id: reset_timer
+    mode: restart
+    then:
+      - delay: 2s
+      - lambda: 'id(press_count) = 0;'
+
+globals:
+  - id: press_count
+    type: int
+    restore_value: false
+    initial_value: '0'
